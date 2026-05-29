@@ -26,6 +26,7 @@ export default function App() {
   const [done, setDone] = useState(new Set());
   const [loading, setLoading] = useState(true);
   const [proposals, setProposals] = useState([]); // Phase 4: load from plan_proposals
+  const [historyByHabit, setHistoryByHabit] = useState(new Map());
 
   const todayISO = useMemo(() => new Date().toISOString().slice(0, 10), []);
 
@@ -38,12 +39,14 @@ export default function App() {
     let cancelled = false;
 
     async function load() {
+      const since = new Date(Date.now() - 97 * 86400000).toISOString().slice(0, 10);
       const [
         { data: habitsData },
         { data: intentionsData },
         { data: identitiesData },
         { data: goalsData },
         { data: logsData },
+        { data: historyData },
       ] = await Promise.all([
         supabase.from("habits").select("id, name, tiny_version, status, goal_id, activation_order")
           .in("status", ["active", "queued"]).order("activation_order"),
@@ -52,6 +55,8 @@ export default function App() {
         supabase.from("goals").select("id, identity_id"),
         supabase.from("habit_logs").select("habit_id")
           .eq("log_date", todayISO).eq("status", "done"),
+        supabase.from("habit_logs").select("habit_id, log_date")
+          .gte("log_date", since).eq("status", "done"),
       ]);
 
       if (cancelled) return;
@@ -78,8 +83,15 @@ export default function App() {
         };
       });
 
+      const histMap = new Map();
+      for (const { habit_id, log_date } of (historyData ?? [])) {
+        if (!histMap.has(habit_id)) histMap.set(habit_id, new Set());
+        histMap.get(habit_id).add(log_date);
+      }
+
       setHabits(shaped);
       setDone(new Set((logsData ?? []).map((l) => l.habit_id)));
+      setHistoryByHabit(histMap);
       setLoading(false);
     }
 
@@ -131,7 +143,7 @@ export default function App() {
           )}
           {tab === "coach" && <Coach />}
           {tab === "plan" && <Plan proposals={proposals} habits={habits} done={done} onAccept={acceptProposal} />}
-          {tab === "progress" && <Progress active={active} done={done} />}
+          {tab === "progress" && <Progress active={active} done={done} historyByHabit={historyByHabit} />}
         </div>
 
         <nav style={S.nav}>
@@ -411,9 +423,9 @@ function Plan({ proposals, habits, done, onAccept }) {
 }
 
 /* ---------- PROGRESS (garden by default, heatmap a tap away) ---------- */
-function Progress({ active, done }) {
+function Progress({ active, done, historyByHabit }) {
   const [view, setView] = useState("garden");
-  const histories = active.map((h) => ({ habit: h, ...computeHistory(h, done) }));
+  const histories = active.map((h) => ({ habit: h, ...computeHistory(h, historyByHabit, done) }));
   const totalVotes = histories.reduce((s, x) => s + x.total, 0);
 
   return (
@@ -590,26 +602,30 @@ function Stat({ n, label, hue }) {
   );
 }
 
-/* ---------- mock history (Phase 2 will replace with real habit_logs query) ---------- */
-function hash01(s) { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return ((h >>> 0) % 10000) / 10000; }
-function rngDone(habit, d, a) {
-  const r = hash01(`${habit.id}|${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`);
-  const dow = d.getDay();
-  let p = dow === 0 || dow === 6 ? 0.35 : 0.65;
-  p *= 0.72 + 0.28 * (1 - a / 95);
-  return r < p;
-}
-function computeHistory(habit, doneSet) {
+/* ---------- history from real habit_logs ---------- */
+function computeHistory(habit, historyByHabit, doneSet) {
   const today = new Date(); today.setHours(0, 0, 0, 0);
   const dow = today.getDay();
   const monthStart = new Date(today.getFullYear(), today.getMonth(), 1);
+  const habitDates = historyByHabit.get(habit.id) ?? new Set();
+
   const map = {};
   for (let a = 0; a <= 97; a++) {
     const d = new Date(today); d.setDate(today.getDate() - a);
-    map[a] = a === 0 ? (doneSet.has(habit.id) ? "done" : "today") : (rngDone(habit, d, a) ? "done" : "miss");
+    const dateStr = d.toISOString().slice(0, 10);
+    map[a] = a === 0
+      ? (doneSet.has(habit.id) ? "done" : "today")
+      : (habitDates.has(dateStr) ? "done" : "miss");
   }
+
   let total = 0, month = 0;
-  for (let a = 0; a <= 90; a++) if (map[a] === "done") { total++; const d = new Date(today); d.setDate(today.getDate() - a); if (d >= monthStart) month++; }
+  for (let a = 0; a <= 97; a++) {
+    if (map[a] === "done") {
+      total++;
+      const d = new Date(today); d.setDate(today.getDate() - a);
+      if (d >= monthStart) month++;
+    }
+  }
   let cur = 0; for (let a = map[0] === "today" ? 1 : 0; a <= 97; a++) { if (map[a] === "done") cur++; else break; }
   let best = 0, c = 0; for (let a = 97; a >= 0; a--) { if (map[a] === "done") { c++; if (c > best) best = c; } else c = 0; }
 

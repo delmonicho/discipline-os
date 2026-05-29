@@ -65,7 +65,7 @@ Full schema: `supabase/migrations/001_discipline_os.sql`
 
 - **Phase 0** (done) — Auth + prototype drop-in
 - **Phase 1** (done) — Today loop wired to real habits/logs
-- **Phase 2** — Progress wired to real habit_logs history
+- **Phase 2** (done) — Progress wired to real habit_logs history
 - **Phase 3** — Coach streaming (NDJSON)
 - **Phase 4** — Proposals (plan_proposals accept/reject)
 - **Phase 5** — Refactor into components/ + hooks/ (behavior unchanged)
