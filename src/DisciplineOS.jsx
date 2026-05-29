@@ -151,6 +151,12 @@ export default function App() {
     vibrate(8);
   }, []);
 
+  const active = habits.filter((h) => h.status === "active");
+  const queued = habits.filter((h) => h.status === "queued");
+  const warmth = active.length
+    ? [...done].filter((id) => active.some((h) => h.id === id)).length / active.length
+    : 0;
+
   return (
     <div style={S.root}>
       <style>{CSS}</style>
