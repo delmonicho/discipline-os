@@ -1,60 +1,116 @@
-import React, { useState, useRef, useEffect, useCallback } from "react";
+import React, { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { Check, ArrowUp, Sparkles, Moon } from "lucide-react";
+import { supabase } from "./lib/supabase";
+import { useAuth } from "./lib/useAuth";
 
 /*
-  Discipline OS — Today / Coach / Plan  (feel prototype)
-  --------------------------------------------------------
-  Aesthetic: calm, meditative, frictionless. Not Boring's *intentional*
-  press-and-hold-to-complete (hold ~1s → bloom + haptic), rendered in a serene
-  register — drifting gradient mesh, one focal orb at a time, soft glass.
-  Signature idea: the world warms toward dawn as the day's habits complete
-  (competence feedback via atmosphere, not coercive points).
+  Discipline OS — Today / Coach / Plan / Progress
+  ------------------------------------------------
+  Phase 1+: Today loop wired to Supabase (habits + habit_logs).
+  Phases 2–4 will wire Progress, Coach, and Proposals.
+  Phase 5 will split into components/data/hooks.
 
-  All data below is MOCK, shaped to the Supabase schema so it ports cleanly:
-    habits[]            -> table habits (status active|queued, tiny_version, intention)
-    completing an orb   -> insert into habit_logs (status:'done', source:'manual')
-    coach stream        -> swap simulateCoach() for fetch('/functions/v1/coach-stream') NDJSON
-    proposals[]         -> table plan_proposals; Accept => flip queued habit to active
+  Aesthetic: calm, meditative, frictionless. Press-and-hold-to-complete (hold ~1s
+  → bloom + haptic). The world warms toward dawn as habits complete.
 */
 
 const HOLD_MS = 1000;
-
-const HABITS = [
-  { id: "sys", status: "active", name: "System design block", tiny: "Sketch one component · 10 min",
-    identity: "An engineer who thinks in systems", anchor: "After morning coffee",
-    hue: 188, c1: "#5ad1c8", c2: "#2b8aa6" },
-  { id: "fit", status: "active", name: "Train", tiny: "Clothes on · one set",
-    identity: "Someone who trains", anchor: "After I brush my teeth",
-    hue: 14, c1: "#ffb59b", c2: "#e3795f" },
-  { id: "esp", status: "queued", name: "Spanish review", tiny: "5 min spaced review",
-    identity: "A Spanish speaker", anchor: "At lunch", hue: 42, c1: "#ffd98a", c2: "#e0a64e" },
-  { id: "gtr", status: "queued", name: "Guitar", tiny: "One chord-change drill",
-    identity: "A guitarist", anchor: "After dinner", hue: 268, c1: "#cdb6ff", c2: "#9a7be0" },
-  { id: "pot", status: "queued", name: "Pottery", tiny: "10 min centering",
-    identity: "A potter", anchor: "Studio days", hue: 20, c1: "#e8b196", c2: "#c07a55" },
-];
 
 const vibrate = (p) => { try { navigator.vibrate?.(p); } catch { /* no-op */ } };
 const lerp = (a, b, t) => a + (b - a) * t;
 
 export default function App() {
+  const { session } = useAuth();
   const [tab, setTab] = useState("today");
-  const [habits, setHabits] = useState(HABITS);
+  const [habits, setHabits] = useState([]);
   const [done, setDone] = useState(new Set());
-  const [proposals, setProposals] = useState([
-    { id: "p1", change_type: "activate_habit", target: "esp",
-      details: "Bring in Spanish review (5 min daily, at lunch).",
-      rationale: "Your morning two have held for ~3 weeks and feel automatic. There's room for a third now — and lunch is a slot you don't have to defend." },
-  ]);
+  const [loading, setLoading] = useState(true);
+  const [proposals, setProposals] = useState([]); // Phase 4: load from plan_proposals
+
+  const todayISO = useMemo(() => new Date().toISOString().slice(0, 10), []);
+
+  const name = session?.user?.user_metadata?.full_name?.split(" ")[0]
+    ?? session?.user?.email?.split("@")[0]
+    ?? "there";
+
+  useEffect(() => {
+    if (!session) return;
+    let cancelled = false;
+
+    async function load() {
+      const [
+        { data: habitsData },
+        { data: intentionsData },
+        { data: identitiesData },
+        { data: goalsData },
+        { data: logsData },
+      ] = await Promise.all([
+        supabase.from("habits").select("id, name, tiny_version, status, goal_id, activation_order")
+          .in("status", ["active", "queued"]).order("activation_order"),
+        supabase.from("implementation_intentions").select("habit_id, anchor"),
+        supabase.from("identities").select("id, label"),
+        supabase.from("goals").select("id, identity_id"),
+        supabase.from("habit_logs").select("habit_id")
+          .eq("log_date", todayISO).eq("status", "done"),
+      ]);
+
+      if (cancelled) return;
+
+      const goalMap = Object.fromEntries((goalsData ?? []).map((g) => [g.id, g]));
+      const identityMap = Object.fromEntries((identitiesData ?? []).map((i) => [i.id, i]));
+      const intentionMap = Object.fromEntries((intentionsData ?? []).map((i) => [i.habit_id, i]));
+
+      const shaped = (habitsData ?? []).map((h) => {
+        const goal = goalMap[h.goal_id];
+        const identity = goal ? identityMap[goal.identity_id] : null;
+        const intention = intentionMap[h.id];
+        const hue = parseInt(h.id.replace(/-/g, "").slice(0, 8), 16) % 360;
+        return {
+          id: h.id,
+          status: h.status,
+          name: h.name,
+          tiny: h.tiny_version,
+          identity: identity?.label ?? "",
+          anchor: intention?.anchor ?? "",
+          hue,
+          c1: `hsl(${hue} 60% 65%)`,
+          c2: `hsl(${hue} 55% 45%)`,
+        };
+      });
+
+      setHabits(shaped);
+      setDone(new Set((logsData ?? []).map((l) => l.habit_id)));
+      setLoading(false);
+    }
+
+    load();
+    return () => { cancelled = true; };
+  }, [session, todayISO]);
+
+  const completeHabit = useCallback(async (habitId) => {
+    setDone((prev) => { const n = new Set(prev); n.add(habitId); return n; });
+    const { error } = await supabase.from("habit_logs").upsert(
+      { user_id: session.user.id, habit_id: habitId, log_date: todayISO, status: "done", source: "manual" },
+      { onConflict: "habit_id,log_date" }
+    );
+    if (error) setDone((prev) => { const n = new Set(prev); n.delete(habitId); return n; });
+  }, [session, todayISO]);
+
+  const undoHabit = useCallback(async (habitId) => {
+    setDone((prev) => { const n = new Set(prev); n.delete(habitId); return n; });
+    const { error } = await supabase.from("habit_logs").delete()
+      .eq("habit_id", habitId).eq("log_date", todayISO);
+    if (error) setDone((prev) => { const n = new Set(prev); n.add(habitId); return n; });
+  }, [session, todayISO]);
 
   const active = habits.filter((h) => h.status === "active");
   const queued = habits.filter((h) => h.status === "queued");
-  const warmth = active.length ? [...done].filter((id) => active.some((h) => h.id === id)).length / active.length : 0;
+  const warmth = active.length
+    ? [...done].filter((id) => active.some((h) => h.id === id)).length / active.length
+    : 0;
 
   const acceptProposal = (p) => {
-    if (p.change_type === "activate_habit") {
-      setHabits((hs) => hs.map((h) => (h.id === p.target ? { ...h, status: "active" } : h)));
-    }
+    // Phase 4 will replace with real DB mutations (habits update + implementation_intentions insert)
     setProposals((ps) => ps.filter((x) => x.id !== p.id));
     vibrate([10, 24, 12]);
   };
@@ -67,7 +123,11 @@ export default function App() {
       <div style={S.phone}>
         <div style={S.scroll} key={tab}>
           {tab === "today" && (
-            <Today active={active} queued={queued} done={done} setDone={setDone} warmth={warmth} />
+            <Today
+              active={active} queued={queued} done={done}
+              name={name} onComplete={completeHabit} onUndo={undoHabit}
+              warmth={warmth} loading={loading}
+            />
           )}
           {tab === "coach" && <Coach />}
           {tab === "plan" && <Plan proposals={proposals} habits={habits} done={done} onAccept={acceptProposal} />}
@@ -103,7 +163,7 @@ function Ambient({ warmth }) {
 }
 
 /* ---------- TODAY ---------- */
-function Today({ active, queued, done, setDone, warmth }) {
+function Today({ active, queued, done, name, onComplete, onUndo, warmth, loading }) {
   const hour = new Date().getHours();
   const greet = hour < 12 ? "Good morning" : hour < 18 ? "Good afternoon" : "Good evening";
   const allDone = active.length && active.every((h) => done.has(h.id));
@@ -111,16 +171,17 @@ function Today({ active, queued, done, setDone, warmth }) {
   return (
     <div>
       <header className="rise" style={{ ...S.head, animationDelay: "40ms" }}>
-        <div style={S.greet}>{greet}, Nicho</div>
+        <div style={S.greet}>{greet}, {name}</div>
         <div style={S.sub}>
-          {allDone ? "Both votes cast. The day is yours."
+          {loading ? "Loading your habits…"
+            : allDone ? "All votes cast. The day is yours."
             : `${[...done].filter((id) => active.some((h) => h.id === id)).length} of ${active.length} small votes cast today`}
         </div>
       </header>
 
       {active.map((h, i) => (
         <div className="rise" key={h.id} style={{ animationDelay: `${120 + i * 90}ms` }}>
-          <HabitOrb habit={h} done={done.has(h.id)} setDone={setDone} />
+          <HabitOrb habit={h} done={done.has(h.id)} onComplete={onComplete} onUndo={onUndo} />
         </div>
       ))}
 
@@ -141,7 +202,7 @@ function Today({ active, queued, done, setDone, warmth }) {
   );
 }
 
-function HabitOrb({ habit, done, setDone }) {
+function HabitOrb({ habit, done, onComplete, onUndo }) {
   const [p, setP] = useState(0);          // hold progress 0..1
   const [holding, setHolding] = useState(false);
   const [hint, setHint] = useState(false);
@@ -153,9 +214,9 @@ function HabitOrb({ habit, done, setDone }) {
   const finish = useCallback(() => {
     active.current = false; cancelAnimationFrame(raf.current);
     setHolding(false); setP(0);
-    setDone((prev) => { const n = new Set(prev); n.add(habit.id); return n; });
+    onComplete(habit.id);
     setBloom((b) => b + 1); vibrate([12, 30, 16]);
-  }, [habit.id, setDone]);
+  }, [habit.id, onComplete]);
 
   const tick = useCallback(() => {
     if (!active.current) return;
@@ -179,7 +240,7 @@ function HabitOrb({ habit, done, setDone }) {
   };
   useEffect(() => () => cancelAnimationFrame(raf.current), []);
 
-  const undo = () => { setDone((prev) => { const n = new Set(prev); n.delete(habit.id); return n; }); vibrate(8); };
+  const undo = () => { onUndo(habit.id); vibrate(8); };
 
   const ringColor = done ? habit.c1 : holding ? habit.c1 : `${habit.c1}`;
   const glow = done ? 0.9 : holding ? lerp(0.15, 0.85, p) : 0.18;
@@ -244,6 +305,7 @@ function HabitOrb({ habit, done, setDone }) {
 }
 
 /* ---------- COACH (simulated NDJSON stream + inline status pills) ---------- */
+/* Phase 3 will replace simulateCoach() with a real fetch to /functions/v1/coach-stream */
 function Coach() {
   const [msgs, setMsgs] = useState([
     { role: "assistant", text: "Two mornings running on the system-design block — that's the engineer you said you wanted to become, just quietly showing up. How did training land today?" },
@@ -253,8 +315,6 @@ function Coach() {
   const endRef = useRef(null);
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [msgs]);
 
-  // In the real app: POST to /functions/v1/coach-stream, read the ReadableStream,
-  // split on \n, JSON.parse each line -> {type:'text'|'status'|'done'}.
   const simulateCoach = (userText) => {
     const reply = userText.toLowerCase().includes("skip") || userText.toLowerCase().includes("missed")
       ? "Okay — one miss is just data, not a verdict. The rule is never twice. What's the smallest possible version you'd actually do tomorrow: clothes on and one set?"
@@ -530,13 +590,13 @@ function Stat({ n, label, hue }) {
   );
 }
 
-/* ---------- deterministic mock history (ports to: select from habit_logs) ---------- */
+/* ---------- mock history (Phase 2 will replace with real habit_logs query) ---------- */
 function hash01(s) { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return ((h >>> 0) % 10000) / 10000; }
 function rngDone(habit, d, a) {
   const r = hash01(`${habit.id}|${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`);
   const dow = d.getDay();
-  let p = habit.id === "sys" ? (dow === 0 || dow === 6 ? 0.25 : 0.85) : habit.id === "fit" ? 0.45 : 0.55;
-  p *= 0.72 + 0.28 * (1 - a / 95); // gentle growth ramp — you got steadier over time
+  let p = dow === 0 || dow === 6 ? 0.35 : 0.65;
+  p *= 0.72 + 0.28 * (1 - a / 95);
   return r < p;
 }
 function computeHistory(habit, doneSet) {
