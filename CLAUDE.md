@@ -30,7 +30,8 @@ supabase/
 - `HABITS` constant is gone. Habits are fetched from Supabase on mount.
 - Habit shape transform (hue/c1/c2 from UUID hash, identity join, anchor from intentions) lives in `DisciplineOS.jsx` `App.load()`.
 - Orb completions upsert to `habit_logs` (source='manual'); undos delete. Both are optimistic with revert on error.
-- Coach (Phase 3) and Proposals (Phase 4) still use mock/empty state in DisciplineOS.jsx.
+- Coach streams from `/functions/v1/coach-stream` (NDJSON); thread loaded from `coach_messages`.
+- Proposals loaded from `plan_proposals` on Plan tab open; accept sheet handles `activate_habit`; reject sets status='rejected'.
 
 ## Env vars (in .env.local — never commit)
 
@@ -66,6 +67,6 @@ Full schema: `supabase/migrations/001_discipline_os.sql`
 - **Phase 0** (done) — Auth + prototype drop-in
 - **Phase 1** (done) — Today loop wired to real habits/logs
 - **Phase 2** (done) — Progress wired to real habit_logs history
-- **Phase 3** — Coach streaming (NDJSON)
-- **Phase 4** — Proposals (plan_proposals accept/reject)
+- **Phase 3** (done) — Coach streams from coach-stream NDJSON
+- **Phase 4** (done) — Proposals accept/reject with implementation_intentions
 - **Phase 5** — Refactor into components/ + hooks/ (behavior unchanged)

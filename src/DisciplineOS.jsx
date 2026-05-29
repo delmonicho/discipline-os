@@ -25,7 +25,7 @@ export default function App() {
   const [habits, setHabits] = useState([]);
   const [done, setDone] = useState(new Set());
   const [loading, setLoading] = useState(true);
-  const [proposals, setProposals] = useState([]); // Phase 4: load from plan_proposals
+  const [proposals, setProposals] = useState([]);
   const [historyByHabit, setHistoryByHabit] = useState(new Map());
 
   const todayISO = useMemo(() => new Date().toISOString().slice(0, 10), []);
@@ -115,17 +115,41 @@ export default function App() {
     if (error) setDone((prev) => { const n = new Set(prev); n.add(habitId); return n; });
   }, [session, todayISO]);
 
-  const active = habits.filter((h) => h.status === "active");
-  const queued = habits.filter((h) => h.status === "queued");
-  const warmth = active.length
-    ? [...done].filter((id) => active.some((h) => h.id === id)).length / active.length
-    : 0;
+  const loadProposals = useCallback(async () => {
+    if (!session) return;
+    const { data } = await supabase.from("plan_proposals")
+      .select("*").eq("status", "pending").order("created_at");
+    setProposals(data ?? []);
+  }, [session]);
 
-  const acceptProposal = (p) => {
-    // Phase 4 will replace with real DB mutations (habits update + implementation_intentions insert)
-    setProposals((ps) => ps.filter((x) => x.id !== p.id));
+  // Refetch proposals each time the Plan tab opens
+  useEffect(() => {
+    if (tab === "plan") loadProposals();
+  }, [tab, loadProposals]);
+
+  const acceptProposal = useCallback(async (proposal, chosenHabitId, anchor) => {
+    if (proposal.change_type === "activate_habit") {
+      const chosenHabit = habits.find((h) => h.id === chosenHabitId);
+      await supabase.from("habits")
+        .update({ status: "active", activated_at: new Date().toISOString() }).eq("id", chosenHabitId);
+      await supabase.from("implementation_intentions").insert({
+        user_id: session.user.id, habit_id: chosenHabitId,
+        anchor, behavior: chosenHabit?.tiny ?? "", context: null,
+      });
+      await supabase.from("plan_proposals")
+        .update({ status: "accepted", resolved_at: new Date().toISOString() }).eq("id", proposal.id);
+      setHabits((hs) => hs.map((h) => h.id === chosenHabitId ? { ...h, status: "active" } : h));
+    }
+    setProposals((ps) => ps.filter((x) => x.id !== proposal.id));
     vibrate([10, 24, 12]);
-  };
+  }, [session, habits]);
+
+  const rejectProposal = useCallback(async (proposal) => {
+    await supabase.from("plan_proposals")
+      .update({ status: "rejected", resolved_at: new Date().toISOString() }).eq("id", proposal.id);
+    setProposals((ps) => ps.filter((x) => x.id !== proposal.id));
+    vibrate(8);
+  }, []);
 
   return (
     <div style={S.root}>
@@ -142,7 +166,7 @@ export default function App() {
             />
           )}
           {tab === "coach" && <Coach />}
-          {tab === "plan" && <Plan proposals={proposals} habits={habits} done={done} onAccept={acceptProposal} />}
+          {tab === "plan" && <Plan proposals={proposals} habits={habits} done={done} onAccept={acceptProposal} onReject={rejectProposal} />}
           {tab === "progress" && <Progress active={active} done={done} historyByHabit={historyByHabit} />}
         </div>
 
@@ -316,43 +340,94 @@ function HabitOrb({ habit, done, onComplete, onUndo }) {
   );
 }
 
-/* ---------- COACH (simulated NDJSON stream + inline status pills) ---------- */
-/* Phase 3 will replace simulateCoach() with a real fetch to /functions/v1/coach-stream */
+/* ---------- COACH (real NDJSON stream from /functions/v1/coach-stream) ---------- */
+// Message model:
+//   user:      { role:"user", text:string }
+//   assistant: { role:"assistant", segments:[{kind:"text"|"status", text:string}] }
 function Coach() {
-  const [msgs, setMsgs] = useState([
-    { role: "assistant", text: "Two mornings running on the system-design block — that's the engineer you said you wanted to become, just quietly showing up. How did training land today?" },
-  ]);
+  const { session } = useAuth();
+  const [msgs, setMsgs] = useState([]);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const endRef = useRef(null);
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [msgs]);
 
-  const simulateCoach = (userText) => {
-    const reply = userText.toLowerCase().includes("skip") || userText.toLowerCase().includes("missed")
-      ? "Okay — one miss is just data, not a verdict. The rule is never twice. What's the smallest possible version you'd actually do tomorrow: clothes on and one set?"
-      : "That's a real vote cast. I'm noticing mornings are where you're strongest — worth protecting that slot fiercely. Want to keep tomorrow identical, or nudge the block to 12 minutes?";
-    const status = "📝 remembered: mornings are landing; protect the slot";
-
-    setStreaming(true);
-    setMsgs((m) => [...m, { role: "assistant", text: "", status: null }]);
-    let i = 0;
-    const showStatusAt = Math.floor(reply.length * 0.55);
-    const iv = setInterval(() => {
-      i += 2;
-      setMsgs((m) => {
-        const n = [...m]; const last = { ...n[n.length - 1] };
-        last.text = reply.slice(0, i);
-        if (i >= showStatusAt && !last.status) last.status = status;
-        n[n.length - 1] = last; return n;
+  // Load thread on mount
+  useEffect(() => {
+    if (!session) return;
+    supabase.from("coach_messages")
+      .select("role, content, created_at")
+      .order("created_at", { ascending: true })
+      .limit(50)
+      .then(({ data }) => {
+        if (!data || data.length === 0) return;
+        setMsgs(data.map((m) =>
+          m.role === "user"
+            ? { role: "user", text: m.content }
+            : { role: "assistant", segments: [{ kind: "text", text: m.content }] }
+        ));
       });
-      if (i >= reply.length) { clearInterval(iv); setStreaming(false); }
-    }, 16);
+  }, [session]);
+
+  const streamCoach = async (userText) => {
+    setStreaming(true);
+    setMsgs((m) => [...m, { role: "assistant", segments: [] }]);
+
+    const appendSeg = (seg) => setMsgs((m) => {
+      const n = [...m];
+      const last = { ...n[n.length - 1], segments: [...n[n.length - 1].segments] };
+      if (seg.kind === "text" && last.segments.length > 0 && last.segments[last.segments.length - 1].kind === "text") {
+        const segs = [...last.segments];
+        segs[segs.length - 1] = { kind: "text", text: segs[segs.length - 1].text + seg.text };
+        last.segments = segs;
+      } else {
+        last.segments = [...last.segments, seg];
+      }
+      n[n.length - 1] = last;
+      return n;
+    });
+
+    try {
+      const res = await fetch(
+        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/coach-stream`,
+        {
+          method: "POST",
+          headers: { "Authorization": `Bearer ${session.access_token}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ message: userText }),
+        }
+      );
+      if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      outer: while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          let evt; try { evt = JSON.parse(line); } catch { continue; }
+          if (evt.type === "text") appendSeg({ kind: "text", text: evt.value });
+          else if (evt.type === "status") appendSeg({ kind: "status", text: evt.value });
+          else if (evt.type === "done") break outer;
+          else if (evt.type === "error") { appendSeg({ kind: "status", text: `⚠️ ${evt.value}` }); break outer; }
+        }
+      }
+    } catch (e) {
+      appendSeg({ kind: "status", text: `⚠️ ${String(e)}` });
+    } finally {
+      setStreaming(false);
+    }
   };
 
   const send = () => {
     const t = input.trim(); if (!t || streaming) return;
-    setMsgs((m) => [...m, { role: "user", text: t }]); setInput("");
-    setTimeout(() => simulateCoach(t), 260);
+    setMsgs((m) => [...m, { role: "user", text: t }]);
+    setInput("");
+    streamCoach(t);
   };
 
   return (
@@ -363,11 +438,23 @@ function Coach() {
       </header>
 
       <div style={S.thread}>
-        {msgs.map((m, i) => (
-          <div key={i} style={m.role === "user" ? S.bubbleUser : S.bubbleCoach}>
-            {m.text}
-            {m.status && <div style={S.statusPill}><Sparkles size={11} strokeWidth={2.4} /> {m.status}</div>}
+        {msgs.length === 0 && !streaming && (
+          <div className="rise" style={{ ...S.bubbleCoach, color: "#8a82ad", animationDelay: "120ms" }}>
+            What's on your mind? I have the full picture — habits, history, what you've shared before.
           </div>
+        )}
+        {msgs.map((m, i) => (
+          m.role === "user" ? (
+            <div key={i} style={S.bubbleUser}>{m.text}</div>
+          ) : (
+            <div key={i} style={S.bubbleCoach}>
+              {m.segments.map((seg, si) =>
+                seg.kind === "text"
+                  ? <span key={si}>{seg.text}</span>
+                  : <div key={si} style={S.statusPill}><Sparkles size={11} strokeWidth={2.4} /> {seg.text}</div>
+              )}
+            </div>
+          )
         ))}
         <div ref={endRef} />
       </div>
@@ -385,8 +472,24 @@ function Coach() {
 }
 
 /* ---------- PLAN (proposals — coach proposes, you decide) ---------- */
-function Plan({ proposals, habits, done, onAccept }) {
+function Plan({ proposals, habits, done, onAccept, onReject }) {
   const active = habits.filter((h) => h.status === "active");
+  const queued = habits.filter((h) => h.status === "queued");
+  const [accepting, setAccepting] = useState(null); // proposal currently being confirmed
+  const [chosenId, setChosenId] = useState("");
+  const [anchor, setAnchor] = useState("");
+
+  const startAccept = (p) => {
+    setChosenId(queued[0]?.id ?? "");
+    setAnchor("");
+    setAccepting(p);
+  };
+  const confirmAccept = () => {
+    if (!chosenId || !accepting) return;
+    onAccept(accepting, chosenId, anchor);
+    setAccepting(null);
+  };
+
   return (
     <div>
       <header className="rise" style={{ ...S.head, animationDelay: "40ms" }}>
@@ -400,11 +503,47 @@ function Plan({ proposals, habits, done, onAccept }) {
         <div className="rise" key={p.id} style={{ ...S.proposal, animationDelay: `${120 + i * 90}ms` }}>
           <div style={S.propTag}>Coach proposes</div>
           <div style={S.propTitle}>{p.details}</div>
-          <div style={S.propWhy}>{p.rationale}</div>
-          <div style={S.propBtns}>
-            <button onClick={() => onAccept(p)} style={S.accept}>Accept</button>
-            <button style={S.decline}>Not yet</button>
-          </div>
+          {p.rationale && <div style={S.propWhy}>{p.rationale}</div>}
+
+          {/* Accept sheet for activate_habit */}
+          {accepting?.id === p.id && (
+            <div style={S.sheet}>
+              {active.length >= 3 ? (
+                <div style={S.sheetGuard}>Only three at a time — pause one first.</div>
+              ) : (
+                <>
+                  <div style={S.sheetField}>
+                    <div style={S.sheetLabel}>Which habit?</div>
+                    <select value={chosenId} onChange={(e) => setChosenId(e.target.value)} style={S.sheetSelect}>
+                      {queued.map((h) => <option key={h.id} value={h.id}>{h.name}</option>)}
+                    </select>
+                  </div>
+                  <div style={S.sheetField}>
+                    <div style={S.sheetLabel}>Anchor (when will you do it?)</div>
+                    <input
+                      value={anchor} onChange={(e) => setAnchor(e.target.value)}
+                      placeholder="After morning coffee…" style={{ ...S.input, padding: "11px 15px", fontSize: 14 }}
+                    />
+                  </div>
+                  <div style={S.propBtns}>
+                    <button onClick={confirmAccept} style={S.accept}>Confirm</button>
+                    <button onClick={() => setAccepting(null)} style={S.decline}>Cancel</button>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+
+          {accepting?.id !== p.id && (
+            <div style={S.propBtns}>
+              {p.change_type === "activate_habit" ? (
+                <button onClick={() => startAccept(p)} style={S.accept}>Accept</button>
+              ) : (
+                <button style={{ ...S.accept, opacity: 0.4, cursor: "default" }} disabled>Coming soon</button>
+              )}
+              <button onClick={() => onReject(p)} style={S.decline}>Not yet</button>
+            </div>
+          )}
         </div>
       ))}
 
@@ -721,6 +860,13 @@ const S = {
     borderRadius: 16, padding: "13px", fontSize: 14.5, fontWeight: 700, cursor: "pointer", fontFamily: "inherit" },
   decline: { flex: 1, background: "rgba(255,255,255,0.06)", color: "#c9c2e0", border: "1px solid rgba(255,255,255,0.1)",
     borderRadius: 16, padding: "13px", fontSize: 14.5, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" },
+  sheet: { marginTop: 16, padding: "16px 0 0", borderTop: "1px solid rgba(255,255,255,0.07)" },
+  sheetField: { marginBottom: 12 },
+  sheetLabel: { fontSize: 11, letterSpacing: "0.07em", textTransform: "uppercase", color: "#8a82ad", fontWeight: 600, marginBottom: 7 },
+  sheetSelect: { width: "100%", background: "rgba(255,255,255,0.07)", border: "1px solid rgba(255,255,255,0.1)",
+    borderRadius: 14, padding: "11px 15px", color: "#ece7f7", fontSize: 14, outline: "none", fontFamily: "inherit",
+    appearance: "none", WebkitAppearance: "none" },
+  sheetGuard: { fontSize: 14, color: "#a79fc4", lineHeight: 1.5, padding: "4px 0 12px" },
   empty: { color: "#8a82ad", fontSize: 14.5, lineHeight: 1.55, padding: "10px 0" },
 
   section: { marginTop: 28 },

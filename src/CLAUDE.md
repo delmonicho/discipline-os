@@ -4,8 +4,8 @@
 src/
   App.tsx            — root: AuthGate + DisciplineOS
   DisciplineOS.jsx   — all four views in one file (Today, Coach, Plan, Progress)
-                       Phase 1 done: Today wired to Supabase (habits + habit_logs).
-                       Coach (Phase 3) and Proposals (Phase 4) still use mock/empty state.
+                       Phases 1–4 done: all four views wired to Supabase.
+                       Phase 5 will split into components/data/hooks (no behavior change).
   lib/
     supabase.ts      — createClient singleton (VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY)
     useAuth.ts       — { session, user, loading, signIn, signOut }
