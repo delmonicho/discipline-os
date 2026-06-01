@@ -7,12 +7,12 @@ supabase/
   migrations/001_discipline_os.sql   ← data model + RLS (§3.2), source-aware logs for HealthKit
   functions/
     _shared/coach-core.ts            ← tools, memory assembly, system prompt (bundled, not deployed)
-    coach/index.ts                   ← single-response coach (simple; week-1 dogfood)
-    coach-stream/index.ts            ← NDJSON streaming coach (the real UX)
+    coach-stream/index.ts            ← NDJSON streaming coach (the only LLM surface)
   seed_personal.sql                  ← your §4 plan as data, so you can talk to it today
 ```
 
-Both functions share `_shared/coach-core.ts`, so they can't drift apart — only the response shape differs.
+The streaming coach is the only deployed LLM function. (A non-streaming `coach/` existed for week-1
+dogfooding; it was removed once `coach-stream` became the real UX — one less path to keep in sync.)
 
 ## How it maps to the blueprint
 
@@ -35,23 +35,28 @@ Both functions share `_shared/coach-core.ts`, so they can't drift apart — only
 ## Deploy
 
 ```bash
-supabase db push                                  # apply the schema
+supabase db push                                  # apply the schema (incl. 002 weekly-review index)
 supabase secrets set ANTHROPIC_API_KEY=sk-ant-... # SUPABASE_URL/ANON_KEY are auto-injected
-supabase functions deploy coach
 supabase functions deploy coach-stream
+supabase functions deploy weekly-review
 # sign up once, grab your auth uid, paste it into seed_personal.sql, run it
 ```
 
-Quick check (non-streaming):
+`weekly-review` writes a `weekly_reviews` row from the last ISO week's logs + chat (the Tier-3
+memory the coach prompt injects), then prunes observations from before this week so `coach_memory`
+stays bounded. It's idempotent (upsert on `user_id, week_start`). Triggered manually today via the
+"Reflect on this week" button in Progress; schedule with pg_cron later (see `../ROADMAP.md`).
+
+Quick check (streaming NDJSON — each line is one `{type,value}` event):
 
 ```bash
-curl -X POST "$SUPABASE_URL/functions/v1/coach" \
+curl -N -X POST "$SUPABASE_URL/functions/v1/coach-stream" \
   -H "Authorization: Bearer <your-user-jwt>" \
   -H "Content-Type: application/json" \
   -d '{"message":"Morning — did my system design block, skipped the gym. Felt behind."}'
 ```
 
-You should get a coached reply, and — if it noticed something durable — a new row in `coach_memory`.
+You should get a streamed coached reply, and — if it noticed something durable — a new row in `coach_memory`. The function logs `coach usage:` per turn (incl. `cache_read_input_tokens`) so you can confirm prompt caching is hitting.
 
 ## Consuming the stream (client)
 
