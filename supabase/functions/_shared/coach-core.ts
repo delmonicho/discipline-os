@@ -66,6 +66,9 @@ export const tools = [
       },
       required: ["change_type", "details", "rationale"],
     },
+    // Cache breakpoint: tools are static, so this caches the whole tools block across turns
+    // (and across the ≤5 within-turn tool-loop iterations).
+    cache_control: { type: "ephemeral" },
   },
 ];
 
@@ -103,9 +106,9 @@ export async function buildState(s: SupabaseClient) {
   const since = new Date(Date.now() - 14 * 864e5).toISOString().slice(0, 10);
   const [{ data: intentions }, { data: logs }] = await Promise.all([
     ids.length ? s.from("implementation_intentions").select("habit_id,anchor,behavior,context").in("habit_id", ids)
-               : Promise.resolve({ data: [] as any[] }),
+               : Promise.resolve({ data: [] as { habit_id: string; anchor: string; behavior: string; context: string | null }[] }),
     ids.length ? s.from("habit_logs").select("habit_id,log_date,status,source").in("habit_id", ids).gte("log_date", since)
-               : Promise.resolve({ data: [] as any[] }),
+               : Promise.resolve({ data: [] as { habit_id: string; log_date: string; status: string; source: string }[] }),
   ]);
 
   return { identities: identities ?? [], goals: goals ?? [], habits: habits ?? [],
@@ -129,13 +132,17 @@ export async function buildHistory(s: SupabaseClient): Promise<Anthropic.Message
 }
 
 // ── System prompt = coaching stance + injected memory ────────────────────────
+// Returns two blocks so the caller can set Anthropic cache breakpoints:
+//   stance  — fully static; caches across turns (prefix order: tools → stance → context).
+//   context — state + memory; volatile per turn, but identical across the within-turn
+//             tool-loop iterations, so it caches there too.
 export function buildSystemPrompt(
   state: Awaited<ReturnType<typeof buildState>>, mem: Awaited<ReturnType<typeof buildMemory>>,
-) {
+): { stance: string; context: string } {
   const active = state.habits.filter((h) => h.status === "active");
   const queued = state.habits.filter((h) => h.status === "queued");
 
-  const fmtHabit = (h: any) => {
+  const fmtHabit = (h: { id: string; name: string; tiny_version: string; cadence: unknown }) => {
     const intent = state.intentions.find((i) => i.habit_id === h.id);
     const hLogs = state.logs.filter((l) => l.habit_id === h.id);
     const done = hLogs.filter((l) => l.status === "done").length;
@@ -166,7 +173,7 @@ export function buildSystemPrompt(
       mem.proposals.map((p) => `- [${p.change_type}] ${p.details}`).join("\n") : "",
   ].filter(Boolean).join("\n");
 
-  return `You are this person's personal habit coach. Your job is to help them build durable habits and discipline toward their goals, over months — not to answer trivia.
+  const stance = `You are this person's personal habit coach. Your job is to help them build durable habits and discipline toward their goals, over months — not to answer trivia.
 
 STANCE: Motivational interviewing. Ask more than you tell. Reflect their own reasons for change back to them. Roll with resistance instead of arguing. Celebrate wins specifically and immediately — the moment of genuine acknowledgement is what wires a habit in. Be warm but honest: push back when a plan is unrealistic or when they're avoiding something. You are a coach, not a cheerleader, and not a therapist — hand off anything outside habit-coaching.
 
@@ -176,9 +183,11 @@ ADAPT: When they're thriving, PROPOSE raising the bar; when struggling, PROPOSE 
 
 MEMORY: Use the remember tool to save what's worth carrying forward — what motivates them, their obstacles, what's working. Save sparingly and concretely.
 
-Here is everything you currently know. Treat it as your own memory of this person; never say "according to my data" — just know it.
+Here is everything you currently know. Treat it as your own memory of this person; never say "according to my data" — just know it.`;
 
-${stateBlock}
+  const context = `${stateBlock}
 
 ${memBlock || "(No coach memory yet — this is early. Pay attention and start building your understanding of them.)"}`;
+
+  return { stance, context };
 }

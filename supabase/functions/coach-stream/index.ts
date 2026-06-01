@@ -40,7 +40,13 @@ Deno.serve(async (req) => {
 
   // persist the user's turn, then build history (which now includes it)
   await supabase.from("coach_messages").insert({ user_id: user.id, role: "user", content: message });
-  const system = buildSystemPrompt(await buildState(supabase), await buildMemory(supabase));
+  // Two cache breakpoints: stance (static, caches across turns) + context (state/memory,
+  // caches across the ≤5 within-turn iterations). Prefix order is tools → system → messages.
+  const { stance, context } = buildSystemPrompt(await buildState(supabase), await buildMemory(supabase));
+  const system: Anthropic.TextBlockParam[] = [
+    { type: "text", text: stance, cache_control: { type: "ephemeral" } },
+    { type: "text", text: context, cache_control: { type: "ephemeral" } },
+  ];
   let messages: Anthropic.MessageParam[] = await buildHistory(supabase);
   const client = anthropic();
 
@@ -56,6 +62,8 @@ Deno.serve(async (req) => {
           ms.on("text", (delta) => { fullText += delta; send({ type: "text", value: delta }); });
 
           const final = await ms.finalMessage();
+          // Usage incl. cache_creation/cache_read tokens — confirms caching is working.
+          console.log("coach usage:", JSON.stringify(final.usage));
           if (final.stop_reason !== "tool_use") break;
 
           const toolResults: Anthropic.ToolResultBlockParam[] = [];
